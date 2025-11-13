@@ -9,8 +9,8 @@ def init_db(path="queue.db"):
     need = not os.path.exists(path)
     conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
+    cur = conn.cursor()
     if need:
-        cur = conn.cursor()
         cur.executescript(
             """
         CREATE TABLE jobs (
@@ -22,16 +22,61 @@ def init_db(path="queue.db"):
             created_at TEXT,
             updated_at TEXT,
             next_attempt_at TEXT,
-            last_error TEXT
+            last_error TEXT,
+            priority INTEGER DEFAULT 0,
+            run_at TEXT,
+            log_path TEXT,
+            timeout INTEGER
         );
 
         CREATE TABLE config (
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE metrics (
+            key TEXT PRIMARY KEY,
+            value REAL
+        );
+
         INSERT INTO config(key, value) VALUES('backoff_base', '2');
+        INSERT INTO metrics(key, value) VALUES('jobs_processed', 0);
+        INSERT INTO metrics(key, value) VALUES('jobs_failed', 0);
+        INSERT INTO metrics(key, value) VALUES('jobs_retried', 0);
         """
         )
+        conn.commit()
+    else:
+        # run migrations: ensure columns exist
+        cur.execute("PRAGMA table_info(jobs)")
+        cols = [r[1] for r in cur.fetchall()]
+        # add missing columns
+        if 'priority' not in cols:
+            cur.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0")
+        if 'run_at' not in cols:
+            cur.execute("ALTER TABLE jobs ADD COLUMN run_at TEXT")
+        if 'log_path' not in cols:
+            cur.execute("ALTER TABLE jobs ADD COLUMN log_path TEXT")
+        if 'timeout' not in cols:
+            cur.execute("ALTER TABLE jobs ADD COLUMN timeout INTEGER")
+        # ensure metrics table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='metrics'")
+        if not cur.fetchone():
+            cur.executescript(
+                """
+            CREATE TABLE metrics (
+                key TEXT PRIMARY KEY,
+                value REAL
+            );
+            INSERT INTO metrics(key, value) VALUES('jobs_processed', 0);
+            INSERT INTO metrics(key, value) VALUES('jobs_failed', 0);
+            INSERT INTO metrics(key, value) VALUES('jobs_retried', 0);
+            """
+            )
+        # ensure config has backoff_base
+        cur.execute("SELECT value FROM config WHERE key='backoff_base'")
+        if not cur.fetchone():
+            cur.execute("INSERT INTO config(key,value) VALUES('backoff_base','2')")
         conn.commit()
     return conn
 
@@ -69,28 +114,47 @@ def fetch_and_lock_job(dbpath):
     conn = sqlite3.connect(dbpath, timeout=30)
     cur = conn.cursor()
     now = _now_ts()
-    cur.execute(
-        """
-    UPDATE jobs SET state='processing', updated_at=?
-    WHERE id = (
-        SELECT id FROM jobs
-        WHERE state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-        ORDER BY created_at LIMIT 1
-    )
-    """,
-        (now, now),
-    )
-    if cur.rowcount == 0:
-        conn.close()
-        return None
-    cur.execute("SELECT id,command,state,attempts,max_retries,created_at,updated_at,next_attempt_at,last_error FROM jobs WHERE state='processing' ORDER BY updated_at DESC LIMIT 1")
-    row = cur.fetchone()
-    conn.commit()
-    conn.close()
-    if not row:
-        return None
-    keys = ["id", "command", "state", "attempts", "max_retries", "created_at", "updated_at", "next_attempt_at", "last_error"]
-    return dict(zip(keys, row))
+    # Safe claim: select candidate, then atomically update by id if still pending
+    while True:
+        cur.execute(
+            "SELECT id FROM jobs WHERE state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (run_at IS NULL OR run_at<=?) ORDER BY priority DESC, created_at LIMIT 1",
+            (now, now),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return None
+        jid = row[0]
+        # try to claim
+        cur.execute("UPDATE jobs SET state='processing', updated_at=? WHERE id=? AND state='pending'", (now, jid))
+        if cur.rowcount == 1:
+            # claimed
+            cur.execute(
+                "SELECT id,command,state,attempts,max_retries,created_at,updated_at,next_attempt_at,last_error,priority,run_at,log_path,timeout FROM jobs WHERE id=?",
+                (jid,),
+            )
+            row2 = cur.fetchone()
+            conn.commit()
+            conn.close()
+            if not row2:
+                return None
+            keys = [
+                "id",
+                "command",
+                "state",
+                "attempts",
+                "max_retries",
+                "created_at",
+                "updated_at",
+                "next_attempt_at",
+                "last_error",
+                "priority",
+                "run_at",
+                "log_path",
+                "timeout",
+            ]
+            return dict(zip(keys, row2))
+        # else someone else claimed it first; loop and try next
 
 
 def complete_job(dbpath, job_id):
