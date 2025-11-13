@@ -1,0 +1,2 @@
+# No external runtime dependencies; using standard library only
+# Add test tools here if you want, e.g., pytest
